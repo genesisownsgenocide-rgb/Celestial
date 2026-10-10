@@ -18,6 +18,7 @@
  * BANAT_DEFAULT_ON=true can be used to start every thread in active mode.
  *
  * CELESTIAL dashboard: open the Railway URL "/" and paste the cookie there.
+ * Dashboard "Auto reply" switch = chat in every thread (with anti-spam, see autoreply.js).
  */
 
 const fs = require("fs");
@@ -27,6 +28,7 @@ const { getTriggerReply, getBanatConversationReply } = require("./triggers");
 const { sendBanatReplyWithTyping } = require("./banat-human");
 const { classifyBanatTarget, setBanatConversationMode, isBanatConversationModeActive } = require("./banat-targeting");
 const store = require("./store");
+const autoreply = require("./autoreply");
 
 // Dashboard key: created on first visit to the dashboard (stored hashed in store.js).
 // No environment variable needed.
@@ -302,6 +304,7 @@ function handleBanatCommand(api, event, body) {
   if (sub === "off" || sub === "disable" || sub === "stop") {
     setBanatConversationMode(threadID, false);
     activeThreads.delete(threadID);
+    autoreply.forgetThread(threadID);
     console.log(`[BANAT] deactivated thread ${threadID}`);
     sendCommandReply(api, event, "banat off. peace 😭");
     return true;
@@ -311,7 +314,7 @@ function handleBanatCommand(api, event, body) {
     const next = !isBanatConversationModeActive(threadID);
     setBanatConversationMode(threadID, next, event.senderID);
     if (next) activeThreads.add(threadID);
-    else activeThreads.delete(threadID);
+    else { activeThreads.delete(threadID); autoreply.forgetThread(threadID); }
     console.log(`[BANAT] toggled thread ${threadID}: ${next ? "ON" : "OFF"}`);
     sendCommandReply(api, event, next ? "banat is on 😭" : "banat is off");
     return true;
@@ -377,6 +380,7 @@ function handleDot(api, event, on) {
   } else {
     setBanatConversationMode(threadID, false);
     activeThreads.delete(threadID);
+    autoreply.forgetThread(threadID);
   }
   console.log(`[BANAT] dot ${on ? "ON" : "OFF"} thread ${threadID} by ${event.senderID || "unknown"}`);
 
@@ -420,24 +424,24 @@ function onMessage(api, event) {
   if (isBanatCommand(body)) { stats.commands++; handleBanatCommand(api, event, body); return; }
 
   const threadID = String(event.threadID);
-  const active = activeThreads.has(threadID) || isBanatConversationModeActive(threadID);
-  const target = classifyBanatTarget({ event, body, botID: botUserID });
+  const senderID = String(event.senderID || "");
 
-  if (active) {
-    console.log(`[BANAT] active message in ${threadID} from ${event.senderID || "unknown"}`);
-    const reply = getTriggerReply(body, threadID) || getBanatConversationReply(body, threadID);
-    if (reply) {
-      sendBanat(api, event, reply).catch(error => console.error("[BANAT] reply error:", error));
-    } else {
-      console.warn(`[BANAT] no reply generated for active message in ${threadID}`);
-    }
+  // Dashboard "Auto reply: ON" = chat in every thread. Otherwise only "."/!banat on threads or direct targets.
+  const active = autoreply.isOn() || activeThreads.has(threadID) || isBanatConversationModeActive(threadID);
+  const target = classifyBanatTarget({ event, body, botID: botUserID });
+  if (!active && !target.shouldRespond) return;
+
+  // Anti-spam for every automatic reply (duplicates, per-person cooldown, per-thread and hourly caps, random skip)
+  if (autoreply.check({ senderID, threadID, body, isAdmin: Boolean(store.rankOf(senderID)) })) return;
+
+  // Never repeat a recent reply in the same thread
+  const reply = autoreply.pickReply(body, threadID, getTriggerReply, getBanatConversationReply);
+  if (!reply) {
+    console.warn(`[BANAT] no reply generated for message in ${threadID}`);
     return;
   }
-
-  if (target.shouldRespond) {
-    const reply = getTriggerReply(body, threadID) || getBanatConversationReply(body, threadID);
-    if (reply) sendBanat(api, event, reply).catch(error => console.error("[BANAT]", error));
-  }
+  console.log(`[BANAT] auto reply in ${threadID} to ${senderID || "unknown"}`);
+  sendBanat(api, event, reply).catch(error => console.error("[BANAT] reply error:", error));
 }
 
 function start(api, gen) {
@@ -482,6 +486,12 @@ function start(api, gen) {
   stopListener = typeof stop === "function"
     ? stop
     : (typeof api.stopListening === "function" ? () => api.stopListening() : null);
+
+  // Bring back the group chats you started from the dashboard (after a restart / reconnect)
+  for (const t of autoreply.listThreads()) {
+    activeThreads.add(t.id);
+    try { setBanatConversationMode(t.id, true, "dashboard"); } catch (_) {}
+  }
 
   console.log(`[BANAT] online${botUserID ? ` as ${botUserID}` : ""}`);
 }
@@ -647,6 +657,92 @@ function guard() {
   }
 }
 
+// ---------------- group chats (dashboard) ----------------
+const OPENER_DEFAULT = process.env.BANAT_OPENER || "sige tumakbo ka na HAHAHAHAHA";
+let groupsCache = { at: 0, list: [] };
+let lastGroupStart = 0;
+
+function fetchThreadList(api, limit) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (err, list) => { if (settled) return; settled = true; err ? reject(err instanceof Error ? err : new Error(String(err?.message || err?.error || JSON.stringify(err)))) : resolve(list || []); };
+    const timer = setTimeout(() => done(new Error("Facebook took too long to return the chat list")), 30000);
+    try {
+      const r = api.getThreadList(limit, null, ["INBOX"], (err, list) => { clearTimeout(timer); done(err, list); });
+      if (r && typeof r.then === "function") r.then((l) => { clearTimeout(timer); done(null, l); }).catch((e) => { clearTimeout(timer); done(e); });
+    } catch (e) { clearTimeout(timer); done(e); }
+  });
+}
+
+async function listGroups(refresh) {
+  const api = currentApi;
+  if (!api || !messengerConnected) throw new Error("Bot is not connected to Messenger");
+  if (typeof api.getThreadList !== "function") throw new Error("This ws3-fca version has no getThreadList()");
+
+  // cache so the dashboard can't hammer Facebook (refresh at most every 10s)
+  const age = Date.now() - groupsCache.at;
+  if (!groupsCache.at || (refresh && age > 10000) || age > 5 * 60 * 1000) {
+    const raw = await fetchThreadList(api, 50);
+    groupsCache = {
+      at: Date.now(),
+      list: raw
+        .filter((t) => t && (t.isGroup === true || t.threadType === 2))
+        .map((t) => ({
+          id: String(t.threadID),
+          name: String(t.name || t.threadName || "Unnamed group").slice(0, 80),
+          members: (t.participantIDs || t.participants || []).length,
+          ts: Number(t.timestamp || 0)
+        }))
+    };
+  }
+
+  const known = new Set(groupsCache.list.map((g) => g.id));
+  const saved = new Map(autoreply.listThreads().map((t) => [t.id, t.name]));
+  const extra = [...activeThreads].filter((id) => !known.has(id)).map((id) => ({ id, name: saved.get(id) || ("Group " + id), members: 0, ts: 0 }));
+
+  return [...groupsCache.list, ...extra]
+    .map((g) => ({ id: g.id, name: g.name, members: g.members, active: activeThreads.has(g.id) }))
+    .sort((a, b) => Number(b.active) - Number(a.active));
+}
+
+async function startGroup(threadID, name, message) {
+  const api = currentApi;
+  if (!api || !messengerConnected) throw new Error("Bot is not connected to Messenger");
+  threadID = String(threadID || "").trim();
+  if (!/^\d{5,25}$/.test(threadID)) throw new Error("Invalid group ID");
+  if (Date.now() - lastGroupStart < 8000) throw new Error("Teka lang, mag-antay ng ilang segundo bago mag-start ng isa pang GC");
+  lastGroupStart = Date.now();
+
+  const text = String(message || "").trim().slice(0, 200) || OPENER_DEFAULT;
+  const label = String(name || "").slice(0, 80);
+  activeThreads.add(threadID);
+  try { setBanatConversationMode(threadID, true, "dashboard"); } catch (_) {}
+  autoreply.rememberThread(threadID, label);
+
+  try {
+    // goes through your humanizer (typing delay etc.) and the same send queue/cooldowns as normal replies
+    await sendBanatReplyWithTyping(api, text, threadID, null, { trafficSendMessage, incomingText: "" });
+    stats.sent++;
+    autoreply.openerSent(threadID);
+    pushEvent("group", `started ${label || threadID}: ${text.slice(0, 60)}`);
+  } catch (error) {
+    // a failed opener must not leave the GC half-started
+    activeThreads.delete(threadID);
+    try { setBanatConversationMode(threadID, false); } catch (_) {}
+    autoreply.forgetThread(threadID);
+    noteError("group start", error);
+    throw new Error("Hindi na-send ang message sa GC: " + (error?.message || error));
+  }
+}
+
+async function stopGroup(threadID) {
+  threadID = String(threadID || "").trim();
+  activeThreads.delete(threadID);
+  try { setBanatConversationMode(threadID, false); } catch (_) {}
+  autoreply.forgetThread(threadID);
+  pushEvent("group", `stopped ${threadID}`);
+}
+
 function threadsInCooldown() {
   const now = Date.now();
   let n = 0;
@@ -689,11 +785,15 @@ try {
     memory_limit_mb: MEMORY_LIMIT_MB,
     admin_count: store.list().length,
     admin_only: Boolean(store.getSettings().admin_only),
+    ...autoreply.snapshot(),
     updated_at: new Date().toISOString()
   }), {
     setPaused: (paused) => { botPaused = Boolean(paused); },
     getPaused: () => botPaused,
     getEvents: () => events,
+    listGroups,
+    startGroup,
+    stopGroup,
     setBio: (bio) => new Promise((resolve, reject) => {
       const api = currentApi;
       if (!api || !messengerConnected) return reject(new Error("Bot is not connected to Messenger"));
