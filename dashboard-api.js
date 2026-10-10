@@ -1,12 +1,13 @@
 "use strict";
 
 // CELESTIAL — Messenger control dashboard + API (single file, same-origin)
-// Open the Render URL "/" to see the dashboard. No VITE_* config needed.
+// Open the Railway URL "/" to see the dashboard. No VITE_* config needed.
 
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const store = require("./store");
 
 const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -27,14 +28,18 @@ main{padding:14px;max-width:720px;margin:auto;display:grid;gap:12px}
 .pill{display:inline-block;padding:5px 12px;border-radius:99px;font-size:13px;font-weight:600}
 .pill.ok{background:#38e0a022}.pill.bad{background:#ff5a7a22}
 h2{margin:0 0 10px;font-size:15px}
-textarea,input{width:100%;background:#09081a;border:1px solid var(--line);color:var(--tx);border-radius:12px;padding:12px;font:13px monospace}
+textarea,input,select{width:100%;background:#09081a;border:1px solid var(--line);color:var(--tx);border-radius:12px;padding:12px;font:13px monospace}
 textarea{min-height:110px}
+input[type=checkbox]{width:auto}
 button{border:0;border-radius:12px;padding:12px 14px;font-weight:700;color:#fff;background:linear-gradient(135deg,var(--ac),#5a4bd8);cursor:pointer}
 button.g{background:#1a1735;border:1px solid var(--line)}button.r{background:#a8233f}button.s{background:#16825a}
+button.x{padding:6px 10px;flex:none}
 .row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.row button{flex:1;min-width:110px}
 .ev{font:12px monospace;padding:7px 0;border-bottom:1px solid var(--line);color:var(--mut)}.ev b{color:var(--tx)}
-.kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.kv{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
 .kv span:first-child{color:var(--mut)}.kv span:last-child{text-align:right;word-break:break-all}
+.mt{margin-top:8px}
+.cnt{color:var(--mut);font-size:11px;text-align:right;margin-top:4px}
 #err{display:none;background:#ff5a7a1c;border:1px solid #ff5a7a66;color:#ffb3c1;border-radius:12px;padding:10px;font-size:13px}
 #login{display:none}
 </style></head><body>
@@ -42,7 +47,7 @@ button.g{background:#1a1735;border:1px solid var(--line)}button.r{background:#a8
 <main>
 <div id="err"></div>
 <div class="card" id="login"><h2>Dashboard key</h2>
-<input id="key" type="password" placeholder="ECLIPSE_DASHBOARD_API_KEY" autocomplete="off">
+<input id="key" type="password" placeholder="CELESTIAL_DASHBOARD_API_KEY" autocomplete="off">
 <div class="row"><button onclick="saveKey()">Unlock</button></div></div>
 
 <div id="app" style="display:none;gap:12px;grid-template-columns:1fr">
@@ -66,8 +71,26 @@ button.g{background:#1a1735;border:1px solid var(--line)}button.r{background:#a8
 <div class="kv"><span>Account</span><span id="acc">Not linked</span></div>
 <div class="kv"><span>Cookie saved</span><span id="saved">No</span></div>
 <div class="kv"><span>Saved at</span><span id="savedAt">—</span></div>
-<textarea id="cookie" placeholder="Paste cookie / appstate here (JSON array or c_user=...; xs=...)" spellcheck="false"></textarea>
+<textarea id="cookie" class="mt" placeholder="Paste cookie / appstate here (JSON array or c_user=...; xs=...)" spellcheck="false"></textarea>
 <div class="row"><button onclick="sendCookie()">Save &amp; connect</button></div></div>
+
+<div class="card"><h2>Admins</h2>
+<div id="adm"><div class="ev">Loading...</div></div>
+<input id="aid" class="mt" placeholder="Facebook ID (numbers only)" inputmode="numeric" autocomplete="off">
+<input id="an" class="mt" maxlength="40" placeholder="Name (optional)" autocomplete="off">
+<select id="ar" class="mt"><option value="moderator">moderator</option><option value="owner">owner</option></select>
+<div class="row"><button onclick="addAdm()">Add / update admin</button></div></div>
+
+<div class="card"><h2>Settings</h2>
+<div class="kv"><span>Admin only (admins lang ang may access sa bot)</span><span><input id="ao" type="checkbox" onchange="saveSet()"></span></div>
+<div class="cnt">Hindi ito gumagana hangga't wala pang naka-add na admin.</div></div>
+
+<div class="card"><h2>Bot profile</h2>
+<input id="pn" maxlength="40" placeholder="Name (max 40)" autocomplete="off">
+<div class="cnt"><span id="pnc">0</span>/40</div>
+<input id="pb" class="mt" maxlength="101" placeholder="Bio (max 101)" autocomplete="off">
+<div class="cnt"><span id="pbc">0</span>/101</div>
+<div class="row"><button onclick="saveProf()">Save profile</button></div></div>
 
 <div class="card"><h2>All status data</h2><div id="all"></div></div>
 <div class="card"><h2>Activity</h2><div id="ev"><div class="ev">No activity yet.</div></div></div>
@@ -82,10 +105,24 @@ function api(p,o){o=o||{};o.headers=Object.assign({'x-eclipse-dashboard-key':KEY
 return fetch('/api/dashboard/'+p,o).then(function(r){return r.json().then(function(j){if(r.status===401){localStorage.removeItem('cel_key');KEY='';throw new Error('Wrong dashboard key')}if(!r.ok||j.ok===false)throw new Error(j.error||('HTTP '+r.status));return j})})}
 function fmt(s){s=+s||0;var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+(h?h+'h ':'')+m+'m '+(s%60)+'s'}
 function flat(o,p,out){out=out||[];for(var k in o){var v=o[k],n=p?p+'.'+k:k;if(v&&typeof v==='object'&&!Array.isArray(v))flat(v,n,out);else out.push([n,Array.isArray(v)?JSON.stringify(v):String(v)])}return out}
-function esc(s){return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function act(p){api(p,{method:'POST',body:'{}'}).then(function(){showErr('');refresh()}).catch(function(e){showErr(e.message)})}
 function sendCookie(){var c=$('cookie').value.trim();if(!c)return showErr('Paste a cookie first.');
 api('connect-session',{method:'POST',body:JSON.stringify({cookie:c})}).then(function(){$('cookie').value='';showErr('');refresh()}).catch(function(e){showErr(e.message)})}
+
+function loadAdm(){api('admins').then(function(r){
+$('adm').innerHTML=r.admins.length?r.admins.map(function(a){
+return '<div class="kv"><span style="color:var(--tx)">'+esc(a.name||'-')+' · <b>'+esc(a.rank)+'</b><br><small style="letter-spacing:0;font-size:11px">'+esc(a.id)+'</small></span><button class="r x" data-id="'+esc(a.id)+'" onclick="rmAdm(this.dataset.id)">✕</button></div>'}).join(''):'<div class="ev">No admins yet.</div>'}).catch(function(e){showErr(e.message)})}
+function addAdm(){api('admins',{method:'POST',body:JSON.stringify({id:$('aid').value.trim(),name:$('an').value,rank:$('ar').value})}).then(function(){$('aid').value='';$('an').value='';showErr('');loadAdm()}).catch(function(e){showErr(e.message)})}
+function rmAdm(id){if(!confirm('Remove '+id+'?'))return;api('admins/remove',{method:'POST',body:JSON.stringify({id:id})}).then(function(){showErr('');loadAdm()}).catch(function(e){showErr(e.message)})}
+function saveSet(){api('settings',{method:'POST',body:JSON.stringify({admin_only:$('ao').checked})}).then(function(){showErr('')}).catch(function(e){showErr(e.message);loadSet()})}
+function loadSet(){api('settings').then(function(r){$('ao').checked=!!r.settings.admin_only}).catch(function(e){showErr(e.message)})}
+function cnt(){$('pnc').textContent=$('pn').value.length;$('pbc').textContent=$('pb').value.length}
+function saveProf(){api('profile',{method:'POST',body:JSON.stringify({name:$('pn').value,bio:$('pb').value})}).then(function(){showErr('')}).catch(function(e){showErr(e.message)})}
+function loadProf(){api('profile').then(function(r){$('pn').value=r.profile.name;$('pb').value=r.profile.bio;cnt()}).catch(function(e){showErr(e.message)})}
+function loadAll(){loadAdm();loadSet();loadProf()}
+$('pn').addEventListener('input',cnt);$('pb').addEventListener('input',cnt);
+
 function refresh(){
 Promise.all([api('status'),api('health').catch(function(){return {}}),api('session').catch(function(){return {}}),api('events').catch(function(){return {events:[]}})]).then(function(r){
 var s=r[0],h=(r[1].runtime||{}),ss=r[2].session||{},ev=r[3].events||[];
@@ -106,7 +143,8 @@ var rows=flat(s).concat(flat({node:h.node_version,pid:h.pid,database:h.database,
 $('all').innerHTML=rows.map(function(x){return '<div class="kv"><span>'+esc(x[0])+'</span><span>'+esc(x[1])+'</span></div>'}).join('');
 $('ev').innerHTML=ev.length?ev.map(function(e){return '<div class="ev"><b>'+esc(e.type)+'</b> '+esc(e.message)+'<br>'+new Date(e.at).toLocaleTimeString()+'</div>'}).join(''):'<div class="ev">No activity yet.</div>';
 }).catch(function(e){if(!KEY){$('app').style.display='none';$('login').style.display='block'}showErr(e.message)})}
-function start(){if(!KEY){$('login').style.display='block';return}refresh()}
+// loadAll() runs once on unlock, NOT every 5s, so it won't overwrite what you are typing.
+function start(){if(!KEY){$('login').style.display='block';return}refresh();loadAll()}
 start();setInterval(function(){if(KEY)refresh()},5000);
 </script></body></html>`;
 
@@ -183,6 +221,11 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
       req.on("error", reject);
     });
 
+  const readJson = async (req) => {
+    try { return JSON.parse((await readBody(req)) || "{}"); }
+    catch (_) { throw Object.assign(new Error("Invalid JSON"), { status: 400 }); }
+  };
+
   const authorized = (req) => {
     if (!key) return false;
     const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
@@ -200,6 +243,8 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
     pid: process.pid,
     memory: process.memoryUsage()
   });
+
+  const owners = () => store.list().filter((a) => a.rank === "owner");
 
   const server = http.createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -221,7 +266,7 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
     if (!url.pathname.startsWith("/api/dashboard/")) {
       return send(res, 404, { ok: false, error: "Not found" });
     }
-    if (!key) return send(res, 503, { ok: false, error: "Set ECLIPSE_DASHBOARD_API_KEY on this service" });
+    if (!key) return send(res, 503, { ok: false, error: "Set CELESTIAL_DASHBOARD_API_KEY in Railway Variables" });
     if (!authorized(req)) return send(res, 401, { ok: false, error: "Dashboard authorization required" });
 
     const p = url.pathname;
@@ -252,6 +297,54 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
         return send(res, 200, { ok: true, inspector: { generated_at: new Date().toISOString(), user: null } });
       }
 
+      // ---------- Admins / Settings / Profile ----------
+      if (isGet && p === "/api/dashboard/admins") {
+        return send(res, 200, { ok: true, admins: store.list() });
+      }
+      if (isPost && p === "/api/dashboard/admins") {
+        const b = await readJson(req);
+        const id = String(b.id || "").trim();
+        // Don't allow demoting the last owner.
+        const cur = store.get(id);
+        if (cur && cur.rank === "owner" && b.rank !== "owner" && owners().length <= 1) {
+          return send(res, 400, { ok: false, error: "Hindi puwedeng i-demote ang huling owner" });
+        }
+        const admin = store.add(id, b.rank, b.name);
+        log("admin", `Set ${admin.id} as ${admin.rank}`);
+        return send(res, 200, { ok: true, admin });
+      }
+      if (isPost && p === "/api/dashboard/admins/remove") {
+        const b = await readJson(req);
+        const id = String(b.id || "").trim();
+        const cur = store.get(id);
+        if (cur && cur.rank === "owner" && owners().length <= 1) {
+          return send(res, 400, { ok: false, error: "Hindi puwedeng tanggalin ang huling owner" });
+        }
+        const removed = store.remove(id);
+        if (removed) log("admin", `Removed ${id}`);
+        return send(res, 200, { ok: removed });
+      }
+      if (isGet && p === "/api/dashboard/settings") {
+        return send(res, 200, { ok: true, settings: store.getSettings() });
+      }
+      if (isPost && p === "/api/dashboard/settings") {
+        const b = await readJson(req);
+        // Whitelist: only known keys are accepted.
+        const settings = store.setSettings({ admin_only: !!b.admin_only });
+        log("settings", `admin_only = ${settings.admin_only}`);
+        return send(res, 200, { ok: true, settings });
+      }
+      if (isGet && p === "/api/dashboard/profile") {
+        return send(res, 200, { ok: true, profile: store.getProfile() });
+      }
+      if (isPost && p === "/api/dashboard/profile") {
+        const b = await readJson(req);
+        const profile = store.setProfile(b);
+        log("profile", "Bot profile updated");
+        return send(res, 200, { ok: true, profile });
+      }
+
+      // ---------- Bot controls ----------
       if (isPost && p === "/api/dashboard/bot/start") {
         if (typeof controls.setPaused !== "function") return send(res, 501, { ok: false, error: "Bot start control is unavailable" });
         controls.setPaused(false);
@@ -271,12 +364,13 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
         const raw = String(body.cookie || "").trim();
         const parsed = parseCookie(raw);
         if (!parsed) return send(res, 400, { ok: false, error: "Cookie must contain c_user and xs" });
+        fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
         fs.writeFileSync(SESSION_FILE, raw, { mode: 0o600 });
         session.saved = true;
         session.account = parsed.account;
         session.saved_at = new Date().toISOString();
         log("session", "Cookie saved for " + parsed.account);
-        // Hook into the bot: index.js can pass controls.connectSession(raw, parsed)
+        // Hook into the bot: index.js passes controls.connectSession(raw, parsed)
         if (typeof controls.connectSession === "function") {
           try { await controls.connectSession(raw, parsed); log("session", "Connect requested"); }
           catch (e) { log("error", "Connect failed: " + e.message); return send(res, 500, { ok: false, error: "Saved, but connect failed: " + e.message }); }
@@ -299,7 +393,7 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
 
       return send(res, 404, { ok: false, error: "Unsupported dashboard endpoint" });
     } catch (e) {
-      return send(res, 500, { ok: false, error: e.message });
+      return send(res, e.status || 500, { ok: false, error: e.message });
     }
   });
 
