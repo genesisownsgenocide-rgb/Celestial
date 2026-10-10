@@ -17,7 +17,7 @@
  * After "!banat on", Banat stays active for that thread until "!banat off".
  * BANAT_DEFAULT_ON=true can be used to start every thread in active mode.
  *
- * CELESTIAL dashboard: open the Render URL "/" and paste the cookie there.
+ * CELESTIAL dashboard: open the Railway URL "/" and paste the cookie there.
  */
 
 const fs = require("fs");
@@ -26,12 +26,11 @@ const { login } = require("ws3-fca");
 const { getTriggerReply, getBanatConversationReply } = require("./triggers");
 const { sendBanatReplyWithTyping } = require("./banat-human");
 const { classifyBanatTarget, setBanatConversationMode, isBanatConversationModeActive } = require("./banat-targeting");
+const store = require("./store");
 
-// Dashboard password (used if no env var is set on the host).
-// WARNING: anyone who can read this file can control the bot. Keep the repo PRIVATE.
-const DASHBOARD_KEY = "celestial-oFlho12ZwZ2kR8xyOJfe12fb";
+// Dashboard password: set CELESTIAL_DASHBOARD_API_KEY in Railway > Variables.
 if (!process.env.ECLIPSE_DASHBOARD_API_KEY && !process.env.CELESTIAL_DASHBOARD_API_KEY) {
-  process.env.ECLIPSE_DASHBOARD_API_KEY = DASHBOARD_KEY;
+  console.warn("[BANAT] WARNING: CELESTIAL_DASHBOARD_API_KEY is not set. The dashboard API will be disabled.");
 }
 
 // Railway: if a Volume is attached, keep the cookie there so it survives redeploys.
@@ -134,7 +133,7 @@ function readSession() {
     if (fs.existsSync(filePath)) return parseMaybeJson(fs.readFileSync(filePath, "utf8"));
   }
 
-  // 3) Render environment variables
+  // 3) environment variables
   const raw = process.env.FB_COOKIES || process.env.FB_APPSTATE;
   if (raw) return parseMaybeJson(raw);
 
@@ -358,6 +357,10 @@ function onMessage(api, event) {
 
   const body = String(event.body || "").trim();
   if (!body) return;
+
+  // Admin-only mode: only registered admins can use the bot.
+  // Skipped while no admin exists yet, so you can't lock yourself out.
+  if (store.list().length && store.getSettings().admin_only && !store.rankOf(event.senderID)) return;
 
   stats.received++;
   lastMessageAt = new Date().toISOString();
@@ -633,6 +636,8 @@ try {
     last_probe_at: lastProbeAt,
     memory_mb: Math.round(process.memoryUsage().rss / 1048576),
     memory_limit_mb: MEMORY_LIMIT_MB,
+    admin_count: store.list().length,
+    admin_only: Boolean(store.getSettings().admin_only),
     updated_at: new Date().toISOString()
   }), {
     setPaused: (paused) => { botPaused = Boolean(paused); },
