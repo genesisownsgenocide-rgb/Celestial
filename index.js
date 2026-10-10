@@ -28,10 +28,8 @@ const { sendBanatReplyWithTyping } = require("./banat-human");
 const { classifyBanatTarget, setBanatConversationMode, isBanatConversationModeActive } = require("./banat-targeting");
 const store = require("./store");
 
-// Dashboard password: set CELESTIAL_DASHBOARD_API_KEY in Railway > Variables.
-if (!process.env.ECLIPSE_DASHBOARD_API_KEY && !process.env.CELESTIAL_DASHBOARD_API_KEY) {
-  console.warn("[BANAT] WARNING: CELESTIAL_DASHBOARD_API_KEY is not set. The dashboard API will be disabled.");
-}
+// Dashboard key: created on first visit to the dashboard (stored hashed in store.js).
+// No environment variable needed.
 
 // Railway: if a Volume is attached, keep the cookie there so it survives redeploys.
 if (!process.env.CELESTIAL_SESSION_FILE && process.env.RAILWAY_VOLUME_MOUNT_PATH) {
@@ -643,6 +641,22 @@ try {
     setPaused: (paused) => { botPaused = Boolean(paused); },
     getPaused: () => botPaused,
     getEvents: () => events,
+    setBio: (bio) => new Promise((resolve, reject) => {
+      const api = currentApi;
+      if (!api || !messengerConnected) return reject(new Error("Bot is not connected to Messenger"));
+      if (typeof api.changeBio !== "function") return reject(new Error("This ws3-fca version has no changeBio()"));
+      let settled = false;
+      const done = (err, res) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err instanceof Error ? err : new Error(String(err?.message || err?.error || JSON.stringify(err))));
+        else resolve(res);
+      };
+      try {
+        const ret = api.changeBio(String(bio || "").slice(0, 101), true, done);
+        if (ret && typeof ret.then === "function") ret.then((r) => done(null, r)).catch(done);
+      } catch (e) { done(e); }
+    }),
     connectSession: async (raw) => {
       sessionOverride = raw;
       manualStop = false;
