@@ -78,7 +78,7 @@ function noteError(where, error) {
 
 // --- watchdog / auto-recovery state ---
 const MAX_RECONNECTS = Math.max(1, Number(process.env.BANAT_MAX_RECONNECTS || 10));
-const PROBE_INTERVAL_MS = Math.max(60000, Number(process.env.BANAT_PROBE_INTERVAL_MS || 5 * 60 * 1000));
+const PROBE_INTERVAL_MS = Math.max(60000, Number(process.env.BANAT_PROBE_INTERVAL_MS || 3 * 60 * 1000));
 const MEMORY_LIMIT_MB = Math.max(150, Number(process.env.BANAT_MEMORY_LIMIT_MB || 450));
 const LOGIN_TIMEOUT_MS = 60000;
 const RETRY_AFTER_GIVE_UP_MS = 30 * 60 * 1000;
@@ -347,6 +347,56 @@ async function sendBanat(api, event, text) {
   }
 }
 
+const dotLast = new Map();
+
+function reactMessage(api, emoji, messageID, force) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (err, info) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(info);
+    };
+    try {
+      const returned = api.setMessageReaction(emoji, messageID, done, force);
+      if (returned && typeof returned.then === "function") returned.then(info => done(null, info)).catch(done);
+    } catch (error) {
+      done(error);
+    }
+  });
+}
+
+function handleDot(api, event, on) {
+  const threadID = String(event.threadID);
+
+  // "." turns Banat ON for this thread, ".." turns it OFF (same as !banat on / !banat off)
+  if (on) {
+    setBanatConversationMode(threadID, true, event.senderID);
+    activeThreads.add(threadID);
+  } else {
+    setBanatConversationMode(threadID, false);
+    activeThreads.delete(threadID);
+  }
+  console.log(`[BANAT] dot ${on ? "ON" : "OFF"} thread ${threadID} by ${event.senderID || "unknown"}`);
+
+  if (!event.messageID || typeof api.setMessageReaction !== "function") return;
+
+  // small per-thread throttle on the reaction so spamming dots can't hammer Facebook
+  const now = Date.now();
+  if (now - Number(dotLast.get(threadID) || 0) < 3000) return;
+  dotLast.set(threadID, now);
+
+  const emoji = on ? "❤" : "💤";
+  // ❤ is a standard Messenger reaction; 💤 needs the "custom reaction" flag. Retry with the other flag if one fails.
+  (async () => {
+    try { await reactMessage(api, emoji, event.messageID, !on); }
+    catch (_) { await reactMessage(api, emoji, event.messageID, on); }
+  })()
+    .then(() => { stats.sent++; pushEvent("reaction", `thread ${threadID}: ${emoji}`); })
+    .catch(error => { noteError("dot reaction", error); console.error("[BANAT] dot reaction failed:", error?.message || error); });
+}
+
 function onMessage(api, event) {
   if (!event) return;
   if (event.type && event.type !== "message") return;
@@ -363,6 +413,9 @@ function onMessage(api, event) {
   stats.received++;
   lastMessageAt = new Date().toISOString();
   pushEvent("message", `thread ${event.threadID} · ${event.senderID || "?"}: ${body.slice(0, 60)}`);
+
+  // "." = Banat ON (reacts ❤), ".." = Banat OFF (reacts 💤).
+  if (body === "." || body === "..") { stats.commands++; handleDot(api, event, body === "."); return; }
 
   if (isBanatCommand(body)) { stats.commands++; handleBanatCommand(api, event, body); return; }
 
