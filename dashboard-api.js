@@ -10,6 +10,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const store = require("./store");
+const autoreply = require("./autoreply");
 
 const CSS = `
 :root{--bg:#07060f;--card:#0e0c1c;--line:#26214a;--tx:#ece9ff;--mut:#8b86b8;--ac:#8b7bff;--ac2:#4fd1ff;--ok:#38e0a0;--bad:#ff5a7a}
@@ -75,6 +76,18 @@ const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div class="card"><div class="k">Last connected</div><div class="v" id="lc" style="font-size:14px">Never</div></div>
 <div class="card"><div class="k">Last disconnected</div><div class="v" id="ld" style="font-size:14px">Never</div></div>
 </div>
+
+<div class="card"><h2>Auto reply · all chats</h2>
+<div class="v" id="autoState">—</div>
+<div class="cnt" id="autoStats" style="text-align:left;margin-top:8px"></div>
+<div class="row"><button id="autoBtn" class="s">Turn ON</button></div></div>
+
+<div class="card"><h2>Group chats</h2>
+<p class="note">Pili ng GC. Pag-Start, magse-send ang bot ng message sa baba, tapos mag-aauto reply (humanized, may random skip) sa mga mag-chat doon.</p>
+<input id="gmsg" value="sige tumakbo ka na HAHAHAHAHA" maxlength="200">
+<div class="row"><button class="g" onclick="loadGroups(true)">Refresh list</button></div>
+<div id="glist" style="margin-top:8px"><div class="ev">Connect the bot first.</div></div></div>
+
 <div class="card"><h2>Controls</h2>
 <div class="row"><button class="s" onclick="act('bot/start')">▶ Start</button>
 <button class="r" onclick="act('bot/stop')">■ Stop</button></div>
@@ -111,13 +124,27 @@ function fmt(s){s=+s||0;var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=M
 function flat(o,p,out){out=out||[];for(var k in o){var v=o[k],n=p?p+'.'+k:k;if(v&&typeof v==='object'&&!Array.isArray(v))flat(v,n,out);else out.push([n,Array.isArray(v)?JSON.stringify(v):String(v)])}return out}
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function act(p){api(p,{method:'POST',body:'{}'}).then(function(){showErr('');refresh()}).catch(function(e){showErr(e.message)})}
+function setAuto(on){api('autoreply',{method:'POST',body:JSON.stringify({on:on})}).then(function(){showErr('');refresh()}).catch(function(e){showErr(e.message)})}
 function sendCookie(){var c=$('cookie').value.trim();if(!c)return showErr('Paste a cookie first.');
 api('connect-session',{method:'POST',body:JSON.stringify({cookie:c})}).then(function(){$('cookie').value='';showErr('');refresh()}).catch(function(e){showErr(e.message)})}
+var GLOADED=false;
+function renderGroups(g){$('glist').innerHTML=g.length?g.map(function(x){return '<div class="kv"><span style="color:var(--tx)">'+esc(x.name)+'<br><small style="letter-spacing:0;font-size:11px">'+x.members+' members</small></span><button class="'+(x.active?'r':'s')+' x" data-id="'+esc(x.id)+'" data-name="'+esc(x.name)+'" data-active="'+(x.active?1:0)+'" onclick="toggleGroup(this)">'+(x.active?'Stop':'Start')+'</button></div>'}).join(''):'<div class="ev">Walang group chat na nahanap.</div>'}
+function loadGroups(force){$('glist').innerHTML='<div class="ev">Loading...</div>';api('groups'+(force?'?refresh=1':'')).then(function(r){showErr('');renderGroups(r.groups||[])}).catch(function(e){$('glist').innerHTML='<div class="ev">'+esc(e.message)+'</div>'})}
+function toggleGroup(b){var on=b.dataset.active==='1';
+if(!on&&!confirm('Mag-send ng message sa "'+b.dataset.name+'" at mag-auto reply doon?'))return;
+b.disabled=true;
+api('groups/'+(on?'stop':'start'),{method:'POST',body:JSON.stringify({id:b.dataset.id,name:b.dataset.name,message:$('gmsg').value})}).then(function(){showErr('');loadGroups(false);refresh()}).catch(function(e){b.disabled=false;showErr(e.message)})}
 function refresh(){
 Promise.all([api('status'),api('health').catch(function(){return {}}),api('session').catch(function(){return {}}),api('events').catch(function(){return {events:[]}})]).then(function(r){
 var s=r[0],h=(r[1].runtime||{}),ss=r[2].session||{},ev=r[3].events||[];
 $('login').style.display='none';$('setup').style.display='none';$('app').style.display='grid';showErr('');
 var on=!!s.facebook_connected;
+if(on&&!GLOADED){GLOADED=true;loadGroups(false)}if(!on){GLOADED=false}
+var ar=!!s.auto_reply;
+$('autoState').textContent=!ar?'OFF':(on?'ON · bot is chatting':'ON · waiting for the bot to log in');
+$('autoState').className='v '+(ar&&on?'ok':(ar?'':'bad'));
+$('autoBtn').textContent=ar?'Turn OFF':'Turn ON';$('autoBtn').className=ar?'r':'s';$('autoBtn').onclick=function(){setAuto(!ar)};
+$('autoStats').textContent='Who: '+(s.admin_only&&s.admin_count?'admins only':'everyone')+' · Replies this hour: '+(s.replies_last_hour||0)+' · Blocked by anti-spam: '+(s.replies_suppressed||0);
 $('conn').textContent=on?'Connected':'Disconnected';$('conn').className='pill '+(on?'ok':'bad');
 $('m').textContent=on?'ONLINE':'OFFLINE';$('m').className='v '+(on?'ok':'bad');
 var run=s.bot_running!==undefined?s.bot_running:(s.paused!==undefined?!s.paused:on);
@@ -571,6 +598,32 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
       }
       if (isGet && p === "/api/dashboard/user") {
         return send(res, 200, { ok: true, inspector: { generated_at: new Date().toISOString(), user: null } });
+      }
+
+      if (isPost && p === "/api/dashboard/autoreply") {
+        const b = await readJson(req);
+        const on = autoreply.setOn(Boolean(b.on));
+        log("autoreply", "Auto reply " + (on ? "ON" : "OFF"));
+        return send(res, 200, { ok: true, auto_reply: on });
+      }
+
+      if (isGet && p === "/api/dashboard/groups") {
+        if (typeof controls.listGroups !== "function") return send(res, 501, { ok: false, error: "Group list is not wired in index.js" });
+        const groups = await controls.listGroups(url.searchParams.get("refresh") === "1");
+        return send(res, 200, { ok: true, groups });
+      }
+      if (isPost && (p === "/api/dashboard/groups/start" || p === "/api/dashboard/groups/stop")) {
+        const b = await readJson(req);
+        if (p.endsWith("/start")) {
+          if (typeof controls.startGroup !== "function") return send(res, 501, { ok: false, error: "Group start is not wired in index.js" });
+          await controls.startGroup(b.id, b.name, b.message);
+          log("group", "Started " + (b.name || b.id));
+        } else {
+          if (typeof controls.stopGroup !== "function") return send(res, 501, { ok: false, error: "Group stop is not wired in index.js" });
+          await controls.stopGroup(b.id);
+          log("group", "Stopped " + (b.name || b.id));
+        }
+        return send(res, 200, { ok: true });
       }
 
       if (isPost && p === "/api/dashboard/bot/start") {
